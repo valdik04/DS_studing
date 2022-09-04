@@ -3,9 +3,56 @@ import numpy as np
 import requests
 from urllib.parse import urlencode
 import json
+import pingouin as pg
 import matplotlib.pyplot as plt
 import plotly
 import plotly.graph_objs as go
+from scipy.stats import norm
+
+
+def get_bootstrap(
+    data_column_1, # числовые значения первой выборки
+    data_column_2, # числовые значения второй выборки
+    boot_it = 1000, # количество бутстрап-подвыборок
+    statistic = np.mean, # интересующая нас статистика
+    bootstrap_conf_level = 0.95 # уровень значимости
+):
+    boot_data = []
+    for i in range(boot_it): # извлекаем подвыборки
+        samples_1 = data_column_1.sample(
+            len(data_column_1), 
+            replace = True # параметр возвращения
+        ).values
+        
+        samples_2 = data_column_2.sample(
+            len(data_column_1), 
+            replace = True
+        ).values
+        
+        boot_data.append(statistic(samples_1)-statistic(samples_2)) # mean() - применяем статистику
+        
+    pd_boot_data = pd.DataFrame(boot_data)
+        
+    left_quant = (1 - bootstrap_conf_level)/2
+    right_quant = 1 - (1 - bootstrap_conf_level) / 2
+    quants = pd_boot_data.quantile([left_quant, right_quant])
+        
+    p_1 = norm.cdf(
+        x = 0, 
+        loc = np.mean(boot_data), 
+        scale = np.std(boot_data)
+    )
+    p_2 = norm.cdf(
+        x = 0, 
+        loc = -np.mean(boot_data), 
+        scale = np.std(boot_data)
+    )
+    p_value = min(p_1, p_2) * 2
+       
+    return {"boot_data": boot_data, 
+            "quants": quants, 
+            "p_value": p_value}
+
 
 
 '''
@@ -17,6 +64,8 @@ link_to_file - ссылка до новых данных,
 sep_in_file - разделитель в файле
 
 Функция возвращает:
+1) p-value для CR посчитанную с помощью хи-квадрат
+2) p_value для APRU и ARPAU
 1) Обновленный датафрейм group_df,
 2) Пересчитанную таблицу с метриками CR и AOV
 '''
@@ -44,6 +93,9 @@ def add_data_to_groups(groups_df, active_studs_df, checks_df,  link_to_file='def
     groups_df = pd.DataFrame(np.concatenate((groups_df.values, groups_add_df.values), axis=0))
     groups_df.columns = ['id', 'grp']
     
+    if groups_df.id.nunique() != groups_df.id.count():
+        print('New data have old users')
+    
     # Нас интересуют пользователи, которые заходили на платформу 
     active_studs_groups_df = groups_df.query('id in @active_studs_df.student_id').rename(columns={'id' : 'student_id'})
     
@@ -54,10 +106,40 @@ def add_data_to_groups(groups_df, active_studs_df, checks_df,  link_to_file='def
     ab_df['isPay'] = (ab_df.rev > 0)
     
     # Считаем метрики
-    metric = ab_df.groupby('grp', as_index=0).agg({'isPay' : 'mean', 'rev' : 'mean'}). \
-    rename(columns={'isPay': 'CR', 'rev' : 'AOV'})
+    metric_df = ab_df.groupby('grp', as_index=0).agg({'isPay' : ['mean', 'sum'], 'rev' : ['mean', 'sum']}). \
+    rename(columns={'isPay': 'CR', 'rev' : 'ARPU'})
+    metric_df.columns = ['grp', 'CR','sum_users','ARPU', 'sum_rev']
+    metric_df['ARPAU'] = metric_df.sum_rev/metric_df.sum_users
+    metric_df = metric_df.drop(['sum_users', 'sum_rev'], axis=1)
+    
+    #Расчитаваем p-value для CR с помощью хи-квадрат
+    _, _, p_val_CR = pg.chi2_independence(ab_df, x = 'grp', y = 'isPay')
+    
+    #Расчитаваем p-value для ARPU  с помощью бутстрап
+    result_ARPU = get_bootstrap(data_column_1=ab_df.query('grp == "A"').rev,
+    data_column_2=ab_df.query('grp == "B"').rev,
+    boot_it = 1000,
+    statistic = np.mean,
+    bootstrap_conf_level = 0.95)
+    
+    p_val_ARPU  = result_ARPU['p_value']
+    
+    #Расчитаваем p-value для ARPAU с помощью бутстрап
+    result_ARPAU = get_bootstrap(
+    ab_df.query('rev > 0 and grp == "A"').rev, # числовые значения первой выборки
+    ab_df.query('rev > 0 and grp == "B"').rev, # числовые значения второй выборки
+    boot_it = 1000, # количество бутстрап-подвыборок
+    statistic = np.mean, # интересующая нас статистика
+    bootstrap_conf_level = 0.95 # уровень значимости
+    )
+    
+    p_val_ARPAU  = result_ARPAU['p_value']
+    
+    p_value_p_val_ARPU_ARPAU = pd.DataFrame({'p_val_ARPU': [p_val_ARPU], 'p_val_ARPAU': [p_val_ARPAU]})
+    
     #Выводим
-    return groups_df, metric
+    return p_val_CR, p_value_p_val_ARPU_ARPAU, groups_df, metric_df
+    #return groups_df, metric
 
 
 '''
@@ -81,3 +163,5 @@ def print_metric(all_result, name_metric='CR'):
                       yaxis_title="Значение метрики",
                       margin=dict(l=0, r=0, t=30, b=0))
     fig.show()
+    
+    
